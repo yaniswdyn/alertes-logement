@@ -65,6 +65,19 @@ TARGETS = [
     {"name": "Val de Bievre - Gentilly", "url": "https://www.fac-habitat.com/fr/residences-etudiantes/id-53-val-de-bievre", "site": "fac_habitat"},
     {"name": "Jean Jaures - Ivry-sur-Seine", "url": "https://www.fac-habitat.com/fr/residences-etudiantes/id-54-jean-jaures", "site": "fac_habitat"},
     {"name": "Carmagnole - Courbevoie", "url": "https://www.fac-habitat.com/fr/residences-etudiantes/id-96-carmagnole", "site": "fac_habitat"},
+    {"name": "Larose - Gennevilliers", "url": "https://www.arpej.fr/fr/residence/residence-etudiante-larose-gennevilliers/", "site": "arpej"},
+    {"name": "Baudin - Gennevilliers", "url": "https://www.arpej.fr/fr/residence/residence-etudiante-baudin-gennevilliers/", "site": "arpej"},
+    {"name": "Neuilly-Roule - Neuilly-sur-Seine", "url": "https://www.arpej.fr/fr/residence/neuilly-roule-residence-etudiante-neuilly-sur-seine/", "site": "arpej"},
+    {"name": "Louis Blériot - Suresnes", "url": "https://www.arpej.fr/fr/residence/etudiante-suresnes/", "site": "arpej"},
+    {"name": "Charles Frederick Worth - Suresnes", "url": "https://www.arpej.fr/fr/residence/residence-etudiante-suresnes/", "site": "arpej"},
+    {"name": "Berthelot - Meudon", "url": "https://www.arpej.fr/fr/residence/berthelot-residence-chercheurs-meudon/", "site": "arpej"},
+    {"name": "Médicis - Le Vésinet", "url": "https://www.arpej.fr/fr/residence/residence-etudiants-le-vesinet-medicis-arpej/", "site": "arpej"},
+    {"name": "Henri Langlois - Bois d'Arcy", "url": "https://www.arpej.fr/fr/residence/residence-etudiante-henri-langlois-bois-darcy/", "site": "arpej"},
+    {"name": "André Dunoyer de Segonzac - Guyancourt", "url": "https://www.arpej.fr/fr/residence/residence-etudiante-andre-dunoyer-segonzac-guyancourt/", "site": "arpej"},
+    {"name": "Cité de la Musique - Paris 19e", "url": "https://www.arpej.fr/fr/residence/cite-de-la-musique-residence-etudiante-paris/", "site": "arpej"},
+    {"name": "Du Conservatoire - Paris 19e", "url": "https://www.arpej.fr/fr/residence/du-conservatoire-residence-etudiante-paris/", "site": "arpej"},
+    {"name": "Edouard Depreux - Sceaux", "url": "https://www.fac-habitat.com/fr/residences-etudiantes/id-47-edouard-depreux", "site": "fac_habitat"},
+    {"name": "Auguste Rodin - Paris 6e", "url": "https://www.fac-habitat.com/fr/residences-etudiantes/id-28-auguste-rodin", "site": "fac_habitat"}
 ]
 
 PRICE_RE = re.compile(
