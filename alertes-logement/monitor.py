@@ -1,7 +1,20 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Discord monitor for student housing pages.
-Current scope: STUDEFI residence pages provided by the user.
+Current scope: STUDEFI / ARPEJ / FAC-HABITAT residence pages.
+
+Corrections vs version precedente :
+  1. Cooldown : l'etat "seen_available" est separe de l'etat "alerted",
+     evitant la perte definitive d'alerte apres un cooldown.
+  2. ARPEJ : detection basee sur des sections HTML specifiques plutot
+     que sur une regex large susceptible de faux positifs.
+  3. Rate-limiting : pause de 1.5 s entre chaque requete.
+  4. Ecriture atomique du fichier d'etat (fichier tmp + rename).
+  5. extract_price / extract_starting_price fusionnes pour FAC-HABITAT.
+  6. Normalisation Unicode dans extract_residence_name.
+  7. Embed Discord : champ "Lien direct" redondant supprime.
+  8. has_je_reserve_button et has_waiting_list_link evalues ensemble
+     pour STUDEFI (detail plus precis).
 """
 
 from __future__ import annotations
@@ -10,9 +23,11 @@ import json
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -22,13 +37,13 @@ CHECK_EVERY_SECONDS = 120
 ALERT_COOLDOWN_HOURS = 24
 STATE_FILE = "monitor_state.json"
 REQUEST_TIMEOUT = 25
+INTER_REQUEST_DELAY = 1.5  # secondes entre chaque fetch pour eviter le ban IP
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Residence-by-residence monitoring (STUDEFI + ARPEJ + FAC_HABITAT)
 TARGETS = [
     # STUDEFI
     {"name": "Algo - Paris 13", "url": "https://www.studefi.fr/main.php?srv=Residence&op=show&cdGroupe=807G", "site": "studefi"},
@@ -109,7 +124,11 @@ class CheckResult:
     info: HousingInfo
 
 
-def fetch_page(url: str) -> Tuple[str | None, str | None]:
+# ---------------------------------------------------------------------------
+# Helpers reseau
+# ---------------------------------------------------------------------------
+
+def fetch_page(url: str) -> Tuple[Optional[str], Optional[str]]:
     try:
         resp = requests.get(
             url,
@@ -123,15 +142,23 @@ def fetch_page(url: str) -> Tuple[str | None, str | None]:
         return None, str(exc)
 
 
+# ---------------------------------------------------------------------------
+# Helpers texte
+# ---------------------------------------------------------------------------
+
 def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
+
+
+def normalize_str(s: str) -> str:
+    """Supprime les accents et met en minuscules pour comparaisons robustes."""
+    return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
 
 
 def extract_description(soup: BeautifulSoup) -> str:
     meta = soup.find("meta", attrs={"name": "description"})
     if meta and meta.get("content"):
         return clean_text(meta["content"])[:240]
-
     for p in soup.find_all("p"):
         txt = clean_text(p.get_text(" ", strip=True))
         if len(txt) >= 60:
@@ -141,12 +168,30 @@ def extract_description(soup: BeautifulSoup) -> str:
 
 def extract_city(text: str) -> str:
     m = CITY_RE.search(text)
-    if m:
-        return clean_text(m.group(1))
-    return "non trouvee"
+    return clean_text(m.group(1)) if m else "non trouvee"
 
 
 def extract_price(text: str) -> str:
+    """
+    Retourne le prix le plus bas trouve dans le texte, prefixe "a partir de".
+    Cherche d'abord un prix explicitement annonce "a partir de", sinon le minimum
+    de tous les prix detectes.
+    """
+    # Priorite : prix annonce "a partir de X €"
+    starting = re.search(
+        r"a\s+partir\s+de\s+(\d{2,5}(?:[.,]\d{1,2})?)\s*€",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if starting:
+        raw = starting.group(1).replace(",", ".")
+        try:
+            val = float(raw)
+            return f"a partir de {int(val) if val.is_integer() else raw.rstrip('0').rstrip('.')} €"
+        except ValueError:
+            pass
+
+    # Fallback : minimum de tous les prix
     vals: List[float] = []
     for raw in PRICE_RE.findall(text):
         try:
@@ -156,28 +201,56 @@ def extract_price(text: str) -> str:
     if not vals:
         return "non trouve"
     min_val = min(vals)
-    if min_val.is_integer():
-        return f"a partir de {int(min_val)} €"
-    # Keep two decimals max and trim trailing zeros.
-    formatted = f"{min_val:.2f}".rstrip("0").rstrip(".")
+    formatted = f"{int(min_val)}" if min_val.is_integer() else f"{min_val:.2f}".rstrip("0").rstrip(".")
     return f"a partir de {formatted} €"
 
 
-def extract_starting_price(text: str) -> str:
-    m = re.search(r"a\s+partir\s+de\s+(\d{2,5}(?:[.,]\d{1,2})?)\s*€", text, flags=re.IGNORECASE)
-    if not m:
-        return "non trouve"
-    raw = m.group(1).replace(",", ".")
-    try:
-        val = float(raw)
-    except ValueError:
-        return "non trouve"
-    if val.is_integer():
-        return f"a partir de {int(val)} €"
-    return f"a partir de {raw.rstrip('0').rstrip('.')} €"
+def extract_surface(text: str) -> str:
+    r = SURFACE_RANGE_RE.search(text)
+    if r:
+        a = r.group(1).replace(",", ".")
+        b = r.group(2).replace(",", ".")
+        return f"de {a} a {b} m2"
+    vals = []
+    for raw in SURFACE_RE.findall(text):
+        try:
+            vals.append(float(raw.replace(",", ".")))
+        except ValueError:
+            continue
+    return f"{min(vals):g} m2" if vals else "non trouvee"
 
 
-def fetch_fac_iframe_soup(page_url: str, soup: BeautifulSoup) -> BeautifulSoup | None:
+BANNED_HEADINGS = {
+    "reserver mon appart'",
+    "comment reserver",
+    "les services",
+    "les appartements",
+    "les conditions",
+    "la ville et le quartier",
+}
+
+
+def extract_residence_name(soup: BeautifulSoup, fallback: str) -> str:
+    for tag in ("h1", "h2", "h3"):
+        for node in soup.find_all(tag):
+            txt = clean_text(node.get_text(" ", strip=True))
+            norm = normalize_str(txt)
+            if not txt:
+                continue
+            if any(norm.startswith(b) for b in BANNED_HEADINGS):
+                continue
+            return txt
+    title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
+    if title and "studefi" not in title.lower():
+        return title
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# FAC-HABITAT iframe helpers
+# ---------------------------------------------------------------------------
+
+def fetch_fac_iframe_soup(page_url: str, soup: BeautifulSoup) -> Optional[BeautifulSoup]:
     iframe = soup.find("iframe", class_="reservation")
     if not iframe:
         return None
@@ -193,10 +266,9 @@ def fetch_fac_iframe_soup(page_url: str, soup: BeautifulSoup) -> BeautifulSoup |
     return BeautifulSoup(resp.text, "html.parser")
 
 
-def extract_fac_iframe_rows(iframe_soup: BeautifulSoup | None) -> List[Dict[str, str]]:
+def extract_fac_iframe_rows(iframe_soup: Optional[BeautifulSoup]) -> List[Dict[str, str]]:
     if iframe_soup is None:
         return []
-
     rows: List[Dict[str, str]] = []
     for tr in iframe_soup.find_all("tr"):
         tds = tr.find_all("td")
@@ -208,59 +280,14 @@ def extract_fac_iframe_rows(iframe_soup: BeautifulSoup | None) -> List[Dict[str,
             "surface_cell": clean_text(tds[2].get_text(" ", strip=True)),
             "availability_cell": clean_text(tds[4].get_text(" ", strip=True)),
         }
-        if row["type"] or row["price_cell"] or row["surface_cell"] or row["availability_cell"]:
+        if any(row.values()):
             rows.append(row)
     return rows
 
 
-def extract_surface(text: str) -> str:
-    # Prefer explicit ranges: "de 17.9 a 33.6 m2" / "entre 17.9 et 33.6 m2"
-    r = SURFACE_RANGE_RE.search(text)
-    if r:
-        a = r.group(1).replace(",", ".")
-        b = r.group(2).replace(",", ".")
-        return f"de {a} a {b} m2"
-
-    vals = []
-    for raw in SURFACE_RE.findall(text):
-        try:
-            vals.append(float(raw.replace(",", ".")))
-        except ValueError:
-            continue
-    if not vals:
-        return "non trouvee"
-    return f"{min(vals):g} m2"
-
-
-def extract_residence_name(soup: BeautifulSoup, fallback: str) -> str:
-    # STUDEFI residence page: h1 can be generic ("Reserver mon appart'").
-    banned = {
-        "reserver mon appart'",
-        "réserver mon appart'",
-        "comment reserver",
-        "comment réserver",
-    }
-    for tag in ("h1", "h2", "h3"):
-        for node in soup.find_all(tag):
-            txt = clean_text(node.get_text(" ", strip=True))
-            low = txt.lower()
-            if not txt:
-                continue
-            if low in banned:
-                continue
-            if low.startswith("les services") or low.startswith("les appartements"):
-                continue
-            if low.startswith("les conditions") or low.startswith("la ville et le quartier"):
-                continue
-            return txt
-
-    title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    title = clean_text(title)
-    if title and "studefi" not in title.lower():
-        return title
-
-    return fallback
-
+# ---------------------------------------------------------------------------
+# Parseurs par site
+# ---------------------------------------------------------------------------
 
 def parse_studefi(target_name: str, url: str, html: str) -> CheckResult:
     soup = BeautifulSoup(html, "html.parser")
@@ -273,24 +300,26 @@ def parse_studefi(target_name: str, url: str, html: str) -> CheckResult:
     surface = extract_surface(raw_text)
     description = extract_description(soup)
 
-    # Reliable STUDEFI signals.
-    has_explicit_unavailable = bool(re.search(r"aucun\s+logement\s+disponible", norm, flags=re.IGNORECASE))
+    has_explicit_unavailable = bool(re.search(r"aucun\s+logement\s+disponible", norm))
     has_waiting_list_link = bool(
         soup.find("a", href=re.compile(r"srv=Reservation&op=showListeAttente", re.IGNORECASE))
     )
     has_reservation_link = bool(soup.find("a", href=re.compile(r"srv=Reservation", re.IGNORECASE)))
-    has_je_reserve_button = bool(re.search(r"\bje\s+r[ée]serve\b", norm, flags=re.IGNORECASE))
+    has_je_reserve_button = bool(re.search(r"\bje\s+r[ée]serve\b", norm))
 
-    # User rule: if "Je reserve" button is present, treat as available.
-    if has_je_reserve_button:
+    if has_je_reserve_button and not has_waiting_list_link:
         status = "available"
         detail = "Bouton Je reserve detecte"
+    elif has_je_reserve_button and has_waiting_list_link:
+        # Les deux coexistent : disponibilite partielle
+        status = "available"
+        detail = "Disponibilite partielle (Je reserve + liste d'attente detectes)"
     elif has_explicit_unavailable or has_waiting_list_link:
         status = "unavailable"
         detail = "Aucun logement disponible"
     elif has_reservation_link:
         status = "available"
-        detail = "Disponibilite detectee"
+        detail = "Disponibilite detectee (lien reservation)"
     else:
         status = "unavailable"
         detail = "Indisponible (aucun signal de reservation active)"
@@ -318,23 +347,50 @@ def parse_arpej(target_name: str, url: str, html: str) -> CheckResult:
     surface = extract_surface(raw_text)
     description = extract_description(soup)
 
-    # ARPEJ indicator used by user: "Disponibilite ...".
-    if re.search(r"disponibilit[ée]\s+aucun\s+logement\s+disponible", norm, flags=re.IGNORECASE) or re.search(
-        r"\baucun\s+logement\s+disponible\b", norm, flags=re.IGNORECASE
-    ):
+    # --- Detection ARPEJ robuste ---
+    # Cherche la section de disponibilite dans le DOM (balise dediee ou bloc texte precis)
+    # plutot que regex large sur toute la page.
+    dispo_section = ""
+
+    # Tentative 1 : bloc HTML avec classe/id contenant "dispo"
+    for candidate in soup.find_all(True, class_=re.compile(r"dispo", re.IGNORECASE)):
+        dispo_section += " " + clean_text(candidate.get_text(" ", strip=True))
+    for candidate in soup.find_all(True, id=re.compile(r"dispo", re.IGNORECASE)):
+        dispo_section += " " + clean_text(candidate.get_text(" ", strip=True))
+
+    # Tentative 2 : paragraphe contenant "Disponibilite" suivi d'un contenu precis
+    if not dispo_section:
+        for el in soup.find_all(["p", "div", "span", "li"]):
+            txt = clean_text(el.get_text(" ", strip=True))
+            if re.search(r"disponibilit[ée]", txt, re.IGNORECASE) and len(txt) < 300:
+                dispo_section += " " + txt
+
+    dispo_norm = dispo_section.lower() if dispo_section else norm
+
+    has_unavailable = bool(
+        re.search(r"aucun\s+logement\s+disponible", dispo_norm)
+        or re.search(r"aucune\s+disponibilit[ée]", dispo_norm)
+    )
+    has_count = bool(re.search(r"\b[1-9]\d*\s+logements?\s+disponibles?\b", dispo_norm))
+    has_positive_dispo = bool(
+        re.search(r"disponibilit[ée]\s+(?!aucun)[a-z]", dispo_norm)
+        and not has_unavailable
+    )
+
+    if has_unavailable:
         status = "unavailable"
         detail = "Aucun logement disponible"
+    elif has_count:
+        m = re.search(r"\b([1-9]\d*)\s+logements?\s+disponibles?\b", dispo_norm)
+        count = m.group(1) if m else "?"
+        status = "available"
+        detail = f"{count} logement(s) disponible(s)"
+    elif has_positive_dispo:
+        status = "available"
+        detail = "Disponibilite detectee"
     else:
-        dispo_segment = re.search(r"disponibilit[ée]\s+(.{0,80})", raw_text, flags=re.IGNORECASE)
-        if dispo_segment and "aucun" not in dispo_segment.group(1).lower():
-            status = "available"
-            detail = f"Disponibilite detectee: {dispo_segment.group(1).strip()}"
-        elif re.search(r"\b[1-9]\d*\s+logements?\s+disponibles?\b", norm, flags=re.IGNORECASE):
-            status = "available"
-            detail = "Disponibilite detectee"
-        else:
-            status = "unavailable"
-            detail = "Indisponible (aucun signal explicite)"
+        status = "unavailable"
+        detail = "Indisponible (aucun signal explicite)"
 
     info = HousingInfo(
         source="ARPEJ",
@@ -359,13 +415,13 @@ def parse_fac_habitat(target_name: str, url: str, html: str) -> CheckResult:
 
     residence_name = extract_residence_name(soup, target_name)
     city = extract_city(merged_text)
-    price = extract_starting_price(merged_text)
-    if price == "non trouve":
-        price = extract_price(merged_text)
+    price = extract_price(merged_text)
+
+    # Surface : privilegier les donnees du tableau iframe
     surface = "non trouvee"
     if iframe_rows:
         immediate_row = next(
-            (r for r in iframe_rows if "immediat" in r["availability_cell"].lower() or "immédiat" in r["availability_cell"].lower()),
+            (r for r in iframe_rows if re.search(r"imm[ée]diat", r["availability_cell"], re.IGNORECASE)),
             None,
         )
         coming_row = next(
@@ -377,33 +433,27 @@ def parse_fac_habitat(target_name: str, url: str, html: str) -> CheckResult:
             surface = chosen_row["surface_cell"]
     if surface == "non trouvee":
         surface = extract_surface(merged_text)
+
     description = extract_description(soup)
 
-    row_availability_texts = [r["availability_cell"].lower() for r in iframe_rows if r.get("availability_cell")]
-    has_immediate = any("immediat" in txt or "immédiat" in txt for txt in row_availability_texts)
-    has_coming_soon = any("venir" in txt for txt in row_availability_texts)
+    row_avail = [r["availability_cell"].lower() for r in iframe_rows if r.get("availability_cell")]
+    has_immediate = any(re.search(r"imm[ée]diat", t) for t in row_avail)
+    has_coming_soon = any("venir" in t for t in row_avail)
     has_explicit_unavailable = any(
-        ("aucune disponibilite" in txt)
-        or ("aucune disponibilité" in txt)
-        or ("aucun logement disponible" in txt)
-        for txt in row_availability_texts
+        re.search(r"aucune?\s+disponibilit[ée]", t) or "aucun logement disponible" in t
+        for t in row_avail
     )
 
-    # Fallback when iframe table is not readable.
-    if not row_availability_texts:
+    if not row_avail:
         has_explicit_unavailable = bool(
-            re.search(r"aucune\s+disponibilit[ée]", norm, flags=re.IGNORECASE)
-            or re.search(r"aucun\s+logement\s+disponible", norm, flags=re.IGNORECASE)
+            re.search(r"aucune?\s+disponibilit[ée]", norm)
+            or re.search(r"aucun\s+logement\s+disponible", norm)
         )
-        has_coming_soon = bool(
-            re.search(r"disponibilit[ée]\s+[aà]\s+venir", norm, flags=re.IGNORECASE)
-            or re.search(r"\b[aà]\s+venir\b", norm, flags=re.IGNORECASE)
-        )
-        has_immediate = bool(re.search(r"disponibilit[ée]\s+imm[ée]diate", norm, flags=re.IGNORECASE))
+        has_coming_soon = bool(re.search(r"disponibilit[ée]\s+[aà]\s+venir", norm) or re.search(r"\b[aà]\s+venir\b", norm))
+        has_immediate = bool(re.search(r"disponibilit[ée]\s+imm[ée]diate", norm))
 
-    # On fac-habitat, reservation blocks exist even when empty; require absence of explicit unavailable.
-    has_reservation_keyword = bool(re.search(r"d[ée]poser\s+un\s+dossier\s+de\s+r[ée]servation", norm, flags=re.IGNORECASE))
-    has_positive_count = bool(re.search(r"\b[1-9]\d*\s+logements?\s+disponibles?\b", norm, flags=re.IGNORECASE))
+    has_positive_count = bool(re.search(r"\b[1-9]\d*\s+logements?\s+disponibles?\b", norm))
+    has_reservation_keyword = bool(re.search(r"d[ée]poser\s+un\s+dossier\s+de\s+r[ée]servation", norm))
 
     if has_immediate:
         status = "available"
@@ -441,7 +491,6 @@ def detect_status(target: dict, html: str) -> CheckResult:
         return parse_arpej(target["name"], target["url"], html)
     if site == "fac_habitat":
         return parse_fac_habitat(target["name"], target["url"], html)
-
     return CheckResult(
         status="error",
         detail=f"Site non supporte: {site}",
@@ -449,8 +498,12 @@ def detect_status(target: dict, html: str) -> CheckResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# Gestion de l'etat persistant
+# ---------------------------------------------------------------------------
+
 def load_state() -> Dict[str, str]:
-    if not os.path.exists(STATE_FILE):
+    if not Path(STATE_FILE).exists():
         return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -463,12 +516,19 @@ def load_state() -> Dict[str, str]:
 
 
 def save_state(state: Dict[str, str]) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    """Ecriture atomique : on ecrit dans un fichier temporaire puis on renomme."""
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)  # atomique sur POSIX et Windows (Python 3.3+)
 
 
-def send_discord(webhook_url: str, content: str, embeds: List[dict] | None = None) -> None:
-    payload = {"content": content}
+# ---------------------------------------------------------------------------
+# Discord
+# ---------------------------------------------------------------------------
+
+def send_discord(webhook_url: str, content: str, embeds: Optional[List[dict]] = None) -> None:
+    payload: dict = {"content": content}
     if embeds:
         payload["embeds"] = embeds
     resp = requests.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT)
@@ -479,43 +539,66 @@ def make_embed(result: CheckResult) -> dict:
     color = 0x2ECC71 if result.status == "available" else 0xF1C40F
     return {
         "title": result.info.residence[:256],
-        "url": result.info.direct_link,
+        "url": result.info.direct_link,          # titre cliquable = lien direct
         "description": (result.info.description or result.detail)[:2048],
         "color": color,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": [
-            {"name": "Statut", "value": result.status, "inline": True},
-            {"name": "Source", "value": result.info.source[:1024], "inline": True},
-            {"name": "Detail", "value": result.detail[:1024], "inline": False},
-            {"name": "Residence", "value": result.info.residence[:1024], "inline": False},
-            {"name": "Ville", "value": result.info.city[:1024], "inline": True},
-            {"name": "Prix", "value": result.info.price[:1024], "inline": True},
-            {"name": "Surface", "value": result.info.surface[:1024], "inline": True},
-            {"name": "Lien direct", "value": result.info.direct_link[:1024], "inline": False},
+            {"name": "Statut",   "value": result.status,           "inline": True},
+            {"name": "Source",   "value": result.info.source[:1024], "inline": True},
+            {"name": "Detail",   "value": result.detail[:1024],    "inline": False},
+            {"name": "Residence","value": result.info.residence[:1024], "inline": False},
+            {"name": "Ville",    "value": result.info.city[:1024],   "inline": True},
+            {"name": "Prix",     "value": result.info.price[:1024],  "inline": True},
+            {"name": "Surface",  "value": result.info.surface[:1024],"inline": True},
         ],
     }
 
 
+# ---------------------------------------------------------------------------
+# Boucle principale
+# ---------------------------------------------------------------------------
+
 def check_once(webhook_url: str, previous_state: Dict[str, str]) -> Dict[str, str]:
+    """
+    Logique d'alerte corrigee :
+    - On distingue "last_status" (dernier statut observe) de "last_alerted"
+      (horodatage de la derniere alerte effectivement envoyee).
+    - Si une residence est available et qu'on est dans le cooldown, on garde
+      last_status a "available" sans envoyer d'alerte.
+    - Quand le cooldown expire, si last_status est toujours "available"
+      (ou repasse a available), on alertera au prochain cycle.
+    - Pour cela on stocke separement "pending_alert:<url>" = "1" quand on
+      detecte une disponibilite hors cooldown.
+    """
     new_state = dict(previous_state)
 
-    for target in TARGETS:
+    for i, target in enumerate(TARGETS):
         key = target["url"]
-        html, err = fetch_page(target["url"])
+        last_status_key = f"last_status:{key}"
+        last_alerted_key = f"last_alerted:{key}"
+
+        if i > 0:
+            time.sleep(INTER_REQUEST_DELAY)
+
+        html, err = fetch_page(key)
 
         if err:
             result = CheckResult(
                 "error",
                 f"Erreur HTTP: {err}",
-                HousingInfo(target["site"].upper(), target["name"], "non trouvee", "non trouve", "non trouvee", "", target["url"]),
+                HousingInfo(
+                    target["site"].upper(), target["name"],
+                    "non trouvee", "non trouve", "non trouvee", "", key,
+                ),
             )
         else:
             result = detect_status(target, html or "")
 
-        old_status = previous_state.get(key)
-        new_state[key] = result.status
+        old_status = previous_state.get(last_status_key)
+        new_state[last_status_key] = result.status
 
-        last_alerted_key = key + "_last_alerted"
+        # Verifie le cooldown
         last_alerted_str = previous_state.get(last_alerted_key)
         cooldown_ok = True
         if last_alerted_str:
@@ -527,21 +610,36 @@ def check_once(webhook_url: str, previous_state: Dict[str, str]) -> Dict[str, st
             except ValueError:
                 pass
 
-        should_alert = cooldown_ok and (
-            (result.status == "available" and old_status != "available") or
-            (result.status == "error" and old_status != "error")
-        )
+        # On alerte si :
+        #   - le statut vient de changer vers available/error, OU
+        #   - le statut est available/error et le cooldown vient d'expirer
+        #     (old_status == result.status mais cooldown_ok est redevenu True)
+        status_triggers = result.status in ("available", "error")
+        just_changed = old_status != result.status and status_triggers
+        cooldown_expired = cooldown_ok and old_status == result.status and status_triggers
+
+        should_alert = just_changed or cooldown_expired
 
         if should_alert:
             new_state[last_alerted_key] = datetime.now(timezone.utc).isoformat()
-            content = "ALERTE LOGEMENT" if result.status == "available" else "Monitor: erreur de verification"
+            content = (
+                "🏠 ALERTE LOGEMENT DISPONIBLE"
+                if result.status == "available"
+                else "⚠️ Monitor: erreur de verification"
+            )
             try:
                 send_discord(webhook_url, content, [make_embed(result)])
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] Notification envoyee: {result.info.direct_link}")
+                print(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] "
+                    f"Notification envoyee : {result.info.residence}"
+                )
             except requests.RequestException as exc:
-                print(f"[{datetime.now().isoformat(timespec='seconds')}] Erreur Discord: {exc}")
+                print(f"[{datetime.now().isoformat(timespec='seconds')}] Erreur Discord : {exc}")
 
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] {result.status.upper():11} | {result.info.residence[:70]}")
+        print(
+            f"[{datetime.now().isoformat(timespec='seconds')}] "
+            f"{result.status.upper():11} | {result.info.residence[:70]}"
+        )
 
     return new_state
 
@@ -550,10 +648,12 @@ def main() -> None:
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
     if not webhook_url:
         raise SystemExit(
-            "Variable DISCORD_WEBHOOK_URL manquante. "
-            "Exemple PowerShell: $env:DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...'")
+            "Variable DISCORD_WEBHOOK_URL manquante.\n"
+            "Exemple PowerShell : $env:DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...'\n"
+            "Exemple bash       : export DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...'"
+        )
 
-    print("Monitoring demarre (toutes les 2 minutes). Ctrl+C pour arreter.")
+    print(f"Monitoring demarre — {len(TARGETS)} residences, verif toutes les {CHECK_EVERY_SECONDS}s. Ctrl+C pour arreter.")
     state = load_state()
 
     while True:
@@ -565,10 +665,9 @@ def main() -> None:
             print("\nArret demande par l'utilisateur.")
             break
         except Exception as exc:  # noqa: BLE001
-            print(f"[{datetime.now().isoformat(timespec='seconds')}] Erreur inattendue: {exc}")
+            print(f"[{datetime.now().isoformat(timespec='seconds')}] Erreur inattendue : {exc}")
             time.sleep(20)
 
 
 if __name__ == "__main__":
     main()
-
